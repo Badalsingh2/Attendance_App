@@ -1,6 +1,6 @@
 """
 Worker Attendance & Payroll Management System
-Premium Edition — Streamlit + SQLite + Pandas
+Premium Edition — Streamlit + Supabase (PostgreSQL) + Pandas
 
 WAGE LOGIC:
   daily_wage    = fixed pay for one 8-hr day
@@ -12,7 +12,8 @@ WAGE LOGIC:
 """
 
 import streamlit as st
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import pandas as pd
 from datetime import date
 import calendar
@@ -377,7 +378,6 @@ def _check_password(entered: str) -> bool:
 
 
 def _show_login_page():
-    # Hide sidebar on login screen
     st.markdown("""
     <style>
     section[data-testid="stSidebar"] { display: none !important; }
@@ -430,7 +430,6 @@ def _show_login_page():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # Show remaining attempts warning
         if attempts > 0:
             left = MAX_ATTEMPTS - attempts
             st.markdown(f"""
@@ -457,7 +456,7 @@ def _show_login_page():
     st.markdown("""
     <div style='text-align:center;margin-top:28px;font-family:IBM Plex Mono,monospace;
                 font-size:0.6rem;color:#3d4f62'>
-    Built with Streamlit · SQLite
+    Built with Streamlit · Supabase
     </div>
     """, unsafe_allow_html=True)
 
@@ -473,14 +472,16 @@ if not st.session_state["_authenticated"]:
 
 
 # ──────────────────────────────────────────────────────────────
-# DATABASE
+# DATABASE  (Supabase / PostgreSQL)
 # ──────────────────────────────────────────────────────────────
-DB_PATH = "payroll.db"
+# Add this to .streamlit/secrets.toml:
+#   DATABASE_URL = "postgresql://postgres:[PASSWORD]@db.[PROJECT_REF].supabase.co:5432/postgres"
+
+DATABASE_URL = st.secrets["DATABASE_URL"]
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL)
     return conn
 
 
@@ -488,21 +489,19 @@ def init_db():
     conn = get_conn()
     cur  = conn.cursor()
 
-    # Workers
     cur.execute("""
         CREATE TABLE IF NOT EXISTS workers (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            name       TEXT    NOT NULL UNIQUE,
-            daily_wage REAL    DEFAULT 400.0
+            id         SERIAL PRIMARY KEY,
+            name       TEXT   NOT NULL UNIQUE,
+            daily_wage REAL   DEFAULT 400.0
         )
     """)
 
-    # Attendance — sunday_pay is now 0 or 1000 per user choice
     cur.execute("""
         CREATE TABLE IF NOT EXISTS attendance (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            id         SERIAL PRIMARY KEY,
             worker_id  INTEGER NOT NULL,
-            date       TEXT    NOT NULL,
+            date       DATE    NOT NULL,
             status     TEXT    NOT NULL CHECK(status IN ('Present','Absent')),
             hours      REAL    DEFAULT 8,
             overtime   REAL    DEFAULT 0,
@@ -512,24 +511,19 @@ def init_db():
         )
     """)
 
-    # Advances — emergency / requested money given to worker
     cur.execute("""
         CREATE TABLE IF NOT EXISTS advances (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            id        SERIAL PRIMARY KEY,
             worker_id INTEGER NOT NULL,
-            date      TEXT    NOT NULL,
+            date      DATE    NOT NULL,
             amount    REAL    NOT NULL,
             reason    TEXT    DEFAULT '',
-            FOREIGN KEY (worker_id) REFERENCES workers(id)
+            FOREIGN KEY (worker_id) REFERENCES advances(id)
         )
     """)
 
-    # Migrate old schema if needed
-    cols = [r[1] for r in cur.execute("PRAGMA table_info(workers)").fetchall()]
-    if "hourly_rate" in cols and "daily_wage" not in cols:
-        cur.execute("ALTER TABLE workers RENAME COLUMN hourly_rate TO daily_wage")
-
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -566,14 +560,19 @@ def enrich_attendance(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_worker(name: str, wage: float):
     conn = get_conn()
+    cur  = conn.cursor()
     try:
-        conn.execute("INSERT INTO workers (name, daily_wage) VALUES (?, ?)", (name.strip(), wage))
+        cur.execute(
+            "INSERT INTO workers (name, daily_wage) VALUES (%s, %s)",
+            (name.strip(), wage)
+        )
         conn.commit()
         return True, "Worker added."
-    except sqlite3.IntegrityError:
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
         return False, "Worker name already exists."
     finally:
-        conn.close()
+        cur.close(); conn.close()
 
 
 def get_workers() -> pd.DataFrame:
@@ -585,16 +584,18 @@ def get_workers() -> pd.DataFrame:
 
 def update_wage(wid: int, wage: float):
     conn = get_conn()
-    conn.execute("UPDATE workers SET daily_wage=? WHERE id=?", (wage, wid))
-    conn.commit(); conn.close()
+    cur  = conn.cursor()
+    cur.execute("UPDATE workers SET daily_wage=%s WHERE id=%s", (wage, wid))
+    conn.commit(); cur.close(); conn.close()
 
 
 def delete_worker(wid: int):
     conn = get_conn()
-    conn.execute("DELETE FROM advances WHERE worker_id=?",   (wid,))
-    conn.execute("DELETE FROM attendance WHERE worker_id=?", (wid,))
-    conn.execute("DELETE FROM workers WHERE id=?",           (wid,))
-    conn.commit(); conn.close()
+    cur  = conn.cursor()
+    cur.execute("DELETE FROM advances   WHERE worker_id=%s", (wid,))
+    cur.execute("DELETE FROM attendance WHERE worker_id=%s", (wid,))
+    cur.execute("DELETE FROM workers    WHERE id=%s",        (wid,))
+    conn.commit(); cur.close(); conn.close()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -603,27 +604,28 @@ def delete_worker(wid: int):
 
 def mark_attendance(wid: int, d: date, status: str, hours: float, sunday_pay: float):
     if status == "Absent": hours = 0.0
-    ot = calc_ot_hours(hours, status)
+    ot   = calc_ot_hours(hours, status)
     conn = get_conn()
-    conn.execute("""
+    cur  = conn.cursor()
+    cur.execute("""
         INSERT INTO attendance (worker_id, date, status, hours, overtime, sunday_pay)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(worker_id, date) DO UPDATE SET
-            status=excluded.status, hours=excluded.hours,
-            overtime=excluded.overtime, sunday_pay=excluded.sunday_pay
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (worker_id, date) DO UPDATE SET
+            status=EXCLUDED.status, hours=EXCLUDED.hours,
+            overtime=EXCLUDED.overtime, sunday_pay=EXCLUDED.sunday_pay
     """, (wid, d.isoformat(), status, hours, ot, sunday_pay))
-    conn.commit(); conn.close()
+    conn.commit(); cur.close(); conn.close()
 
 
 def get_attendance(wid=None, start: date=None, end: date=None) -> pd.DataFrame:
-    conn  = get_conn()
-    q     = """SELECT a.id, a.worker_id, w.name, w.daily_wage,
-                      a.date, a.status, a.hours, a.overtime, a.sunday_pay
-               FROM attendance a JOIN workers w ON a.worker_id=w.id WHERE 1=1"""
+    conn = get_conn()
+    q    = """SELECT a.id, a.worker_id, w.name, w.daily_wage,
+                     a.date, a.status, a.hours, a.overtime, a.sunday_pay
+              FROM attendance a JOIN workers w ON a.worker_id=w.id WHERE 1=1"""
     p = []
-    if wid:   q += " AND a.worker_id=?"; p.append(wid)
-    if start: q += " AND a.date>=?";     p.append(start.isoformat())
-    if end:   q += " AND a.date<=?";     p.append(end.isoformat())
+    if wid:   q += " AND a.worker_id=%s"; p.append(wid)
+    if start: q += " AND a.date>=%s";     p.append(start.isoformat())
+    if end:   q += " AND a.date<=%s";     p.append(end.isoformat())
     q += " ORDER BY a.date, w.name"
     df = pd.read_sql(q, conn, params=p)
     conn.close()
@@ -632,8 +634,9 @@ def get_attendance(wid=None, start: date=None, end: date=None) -> pd.DataFrame:
 
 def delete_attendance(rid: int):
     conn = get_conn()
-    conn.execute("DELETE FROM attendance WHERE id=?", (rid,))
-    conn.commit(); conn.close()
+    cur  = conn.cursor()
+    cur.execute("DELETE FROM attendance WHERE id=%s", (rid,))
+    conn.commit(); cur.close(); conn.close()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -642,9 +645,12 @@ def delete_attendance(rid: int):
 
 def add_advance(wid: int, d: date, amount: float, reason: str):
     conn = get_conn()
-    conn.execute("INSERT INTO advances (worker_id, date, amount, reason) VALUES (?, ?, ?, ?)",
-                 (wid, d.isoformat(), amount, reason.strip()))
-    conn.commit(); conn.close()
+    cur  = conn.cursor()
+    cur.execute(
+        "INSERT INTO advances (worker_id, date, amount, reason) VALUES (%s, %s, %s, %s)",
+        (wid, d.isoformat(), amount, reason.strip())
+    )
+    conn.commit(); cur.close(); conn.close()
 
 
 def get_advances(wid=None, start: date=None, end: date=None) -> pd.DataFrame:
@@ -652,9 +658,9 @@ def get_advances(wid=None, start: date=None, end: date=None) -> pd.DataFrame:
     q    = """SELECT a.id, a.worker_id, w.name, a.date, a.amount, a.reason
               FROM advances a JOIN workers w ON a.worker_id=w.id WHERE 1=1"""
     p = []
-    if wid:   q += " AND a.worker_id=?"; p.append(wid)
-    if start: q += " AND a.date>=?";     p.append(start.isoformat())
-    if end:   q += " AND a.date<=?";     p.append(end.isoformat())
+    if wid:   q += " AND a.worker_id=%s"; p.append(wid)
+    if start: q += " AND a.date>=%s";     p.append(start.isoformat())
+    if end:   q += " AND a.date<=%s";     p.append(end.isoformat())
     q += " ORDER BY a.date DESC, w.name"
     df = pd.read_sql(q, conn, params=p)
     conn.close()
@@ -663,8 +669,9 @@ def get_advances(wid=None, start: date=None, end: date=None) -> pd.DataFrame:
 
 def delete_advance(aid: int):
     conn = get_conn()
-    conn.execute("DELETE FROM advances WHERE id=?", (aid,))
-    conn.commit(); conn.close()
+    cur  = conn.cursor()
+    cur.execute("DELETE FROM advances WHERE id=%s", (aid,))
+    conn.commit(); cur.close(); conn.close()
 
 
 def get_advance_totals(start: date=None, end: date=None) -> pd.DataFrame:
@@ -831,7 +838,6 @@ with st.sidebar:
 
     st.markdown("<hr>", unsafe_allow_html=True)
 
-    # ── Logout button ──────────────────────────────────────
     if st.button("🔒 Logout", use_container_width=True, key="_logout_btn"):
         st.session_state["_authenticated"]  = False
         st.session_state["_login_attempts"] = 0
@@ -842,7 +848,7 @@ with st.sidebar:
     <div style='padding:16px 24px;border-top:1px solid #1f2d3d;
                 font-family:IBM Plex Mono,monospace;font-size:0.62rem;
                 color:#3d4f62;text-align:center'>
-    Built with Streamlit · SQLite
+    Built with Streamlit · Supabase
     </div>
     """, unsafe_allow_html=True)
 
@@ -1322,12 +1328,14 @@ with tab6:
 
     st.markdown("<hr>", unsafe_allow_html=True)
     st.markdown("### 🗄️ Database Info")
-    conn      = get_conn()
-    att_c     = conn.execute("SELECT COUNT(*) FROM attendance").fetchone()[0]
-    adv_c     = conn.execute("SELECT COUNT(*) FROM advances").fetchone()[0]
-    conn.close()
+    conn  = get_conn()
+    cur   = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM attendance"); att_c = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM advances");   adv_c = cur.fetchone()[0]
+    cur.close(); conn.close()
+
     di1,di2,di3 = st.columns(3)
     di1.metric("Workers",      len(workers_df))
     di2.metric("Att. Records", att_c)
     di3.metric("Adv. Records", adv_c)
-    st.markdown(f"**Database file:** `payroll.db`")
+    st.markdown(f"**Database:** Supabase (PostgreSQL)")
