@@ -481,8 +481,10 @@ DATABASE_URL = st.secrets["DATABASE_URL"]
 
 
 def get_conn():
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require"
+    )
 
 
 def init_db():
