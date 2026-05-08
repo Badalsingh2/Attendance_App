@@ -2,3 +2,5 @@
 myenv/
 *.db
 __pycache__/
+run_once.py   
+create_table.py
