@@ -714,7 +714,8 @@ def get_monthly_summary(year: int, month: int) -> pd.DataFrame:
         s["total_canteen"] = 0.0
     s["total_canteen"] = s["total_canteen"].fillna(0.0)
 
-    s["Total_Given"] = s["Sunday_Given"] + s["total_advance"] + s["total_canteen"]
+    # s["Total_Given"] = s["Sunday_Given"] + s["total_advance"] + s["total_canteen"]
+    s["Total_Given"] = s["Sunday_Given"] + s["total_advance"] 
     s["Net_Pay"]     = s["Gross_Salary"] - s["Total_Given"]
 
     s.rename(columns={"name":"Worker","daily_wage":"Daily Wage"}, inplace=True)
