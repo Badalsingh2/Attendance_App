@@ -7,13 +7,14 @@ WAGE LOGIC:
   per_hr        = daily_wage / 8  (auto-derived)
   overtime_pay  = OT_hrs × per_hr
   gross_salary  = (present_days × daily_wage) + overtime_pay
-  money_given   = sunday_cash_given + advances_given + canteen_total  ← cash already handed out / deducted
-  net_salary    = gross_salary − money_given           ← what you still owe
+  money_given   = sunday_cash_given + advances_given + canteen_total
+  net_salary    = gross_salary − money_given
 """
 
 import streamlit as st
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool as pg_pool
 import pandas as pd
 from datetime import date
 import calendar
@@ -31,7 +32,7 @@ st.set_page_config(
 )
 
 # ──────────────────────────────────────────────────────────────
-# PREMIUM CSS — Luxury Dark / Editorial theme
+# PREMIUM CSS
 # ──────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -356,62 +357,78 @@ if not st.session_state["_authenticated"]:
 
 
 # ──────────────────────────────────────────────────────────────
-# DATABASE
+# DATABASE — Connection Pool (reuse SSL connections across reruns)
 # ──────────────────────────────────────────────────────────────
 DATABASE_URL = st.secrets["DATABASE_URL"]
 
 
+@st.cache_resource
+def get_pool():
+    """Create a persistent connection pool shared across all Streamlit reruns."""
+    return pg_pool.SimpleConnectionPool(1, 10, DATABASE_URL, sslmode="require")
+
+
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    return get_pool().getconn()
+
+
+def release_conn(conn):
+    get_pool().putconn(conn)
 
 
 def init_db():
     conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS workers (
-            id         SERIAL PRIMARY KEY,
-            name       TEXT   NOT NULL UNIQUE,
-            daily_wage REAL   DEFAULT 400.0
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS attendance (
-            id         SERIAL PRIMARY KEY,
-            worker_id  INTEGER NOT NULL,
-            date       DATE    NOT NULL,
-            status     TEXT    NOT NULL CHECK(status IN ('Present','Absent')),
-            hours      REAL    DEFAULT 8,
-            overtime   REAL    DEFAULT 0,
-            sunday_pay REAL    DEFAULT 0,
-            UNIQUE(worker_id, date),
-            FOREIGN KEY (worker_id) REFERENCES workers(id)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS advances (
-            id        SERIAL PRIMARY KEY,
-            worker_id INTEGER NOT NULL,
-            date      DATE    NOT NULL,
-            amount    REAL    NOT NULL,
-            reason    TEXT    DEFAULT '',
-            FOREIGN KEY (worker_id) REFERENCES workers(id)
-        )
-    """)
-    # ── NEW: canteen table ──────────────────────────────────────
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS canteen (
-            id        SERIAL PRIMARY KEY,
-            worker_id INTEGER NOT NULL,
-            date      DATE    NOT NULL,
-            item      TEXT    NOT NULL DEFAULT '',
-            amount    REAL    NOT NULL,
-            FOREIGN KEY (worker_id) REFERENCES workers(id)
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS workers (
+                id         SERIAL PRIMARY KEY,
+                name       TEXT   NOT NULL UNIQUE,
+                daily_wage REAL   DEFAULT 400.0
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS attendance (
+                id         SERIAL PRIMARY KEY,
+                worker_id  INTEGER NOT NULL,
+                date       DATE    NOT NULL,
+                status     TEXT    NOT NULL CHECK(status IN ('Present','Absent')),
+                hours      REAL    DEFAULT 8,
+                overtime   REAL    DEFAULT 0,
+                sunday_pay REAL    DEFAULT 0,
+                UNIQUE(worker_id, date),
+                FOREIGN KEY (worker_id) REFERENCES workers(id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS advances (
+                id        SERIAL PRIMARY KEY,
+                worker_id INTEGER NOT NULL,
+                date      DATE    NOT NULL,
+                amount    REAL    NOT NULL,
+                reason    TEXT    DEFAULT '',
+                FOREIGN KEY (worker_id) REFERENCES workers(id)
+            )
+        """)
+        # Canteen: one row per worker per day (daily total, not per-item)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS canteen (
+                id        SERIAL PRIMARY KEY,
+                worker_id INTEGER NOT NULL,
+                date      DATE    NOT NULL,
+                amount    REAL    NOT NULL,
+                UNIQUE(worker_id, date),
+                FOREIGN KEY (worker_id) REFERENCES workers(id)
+            )
+        """)
+        # Migration: drop old 'item' column if it exists (safe to run repeatedly)
+        cur.execute("""
+            ALTER TABLE canteen DROP COLUMN IF EXISTS item;
+        """)
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -447,40 +464,52 @@ def enrich_attendance(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_worker(name: str, wage: float):
     conn = get_conn()
-    cur  = conn.cursor()
     try:
+        cur = conn.cursor()
         cur.execute("INSERT INTO workers (name, daily_wage) VALUES (%s, %s)", (name.strip(), wage))
         conn.commit()
+        cur.close()
         return True, "Worker added."
     except psycopg2.errors.UniqueViolation:
         conn.rollback()
         return False, "Worker name already exists."
     finally:
-        cur.close(); conn.close()
+        release_conn(conn)
 
 
+@st.cache_data(ttl=30)
 def get_workers() -> pd.DataFrame:
     conn = get_conn()
-    df   = pd.read_sql("SELECT * FROM workers ORDER BY name", conn)
-    conn.close()
-    return df
+    try:
+        df = pd.read_sql("SELECT * FROM workers ORDER BY name", conn)
+        return df
+    finally:
+        release_conn(conn)
 
 
 def update_wage(wid: int, wage: float):
     conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("UPDATE workers SET daily_wage=%s WHERE id=%s", (wage, wid))
-    conn.commit(); cur.close(); conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE workers SET daily_wage=%s WHERE id=%s", (wage, wid))
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
 
 
 def delete_worker(wid: int):
     conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("DELETE FROM canteen    WHERE worker_id=%s", (wid,))
-    cur.execute("DELETE FROM advances   WHERE worker_id=%s", (wid,))
-    cur.execute("DELETE FROM attendance WHERE worker_id=%s", (wid,))
-    cur.execute("DELETE FROM workers    WHERE id=%s",        (wid,))
-    conn.commit(); cur.close(); conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM canteen    WHERE worker_id=%s", (wid,))
+        cur.execute("DELETE FROM advances   WHERE worker_id=%s", (wid,))
+        cur.execute("DELETE FROM attendance WHERE worker_id=%s", (wid,))
+        cur.execute("DELETE FROM workers    WHERE id=%s",        (wid,))
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -491,37 +520,48 @@ def mark_attendance(wid: int, d: date, status: str, hours: float, sunday_pay: fl
     if status == "Absent": hours = 0.0
     ot   = calc_ot_hours(hours, status)
     conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        INSERT INTO attendance (worker_id, date, status, hours, overtime, sunday_pay)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (worker_id, date) DO UPDATE SET
-            status=EXCLUDED.status, hours=EXCLUDED.hours,
-            overtime=EXCLUDED.overtime, sunday_pay=EXCLUDED.sunday_pay
-    """, (wid, d.isoformat(), status, hours, ot, sunday_pay))
-    conn.commit(); cur.close(); conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO attendance (worker_id, date, status, hours, overtime, sunday_pay)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (worker_id, date) DO UPDATE SET
+                status=EXCLUDED.status, hours=EXCLUDED.hours,
+                overtime=EXCLUDED.overtime, sunday_pay=EXCLUDED.sunday_pay
+        """, (wid, d.isoformat(), status, hours, ot, sunday_pay))
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
 
 
+@st.cache_data(ttl=15)
 def get_attendance(wid=None, start: date=None, end: date=None) -> pd.DataFrame:
     conn = get_conn()
-    q    = """SELECT a.id, a.worker_id, w.name, w.daily_wage,
-                     a.date, a.status, a.hours, a.overtime, a.sunday_pay
-              FROM attendance a JOIN workers w ON a.worker_id=w.id WHERE 1=1"""
-    p = []
-    if wid:   q += " AND a.worker_id=%s"; p.append(wid)
-    if start: q += " AND a.date>=%s";     p.append(start.isoformat())
-    if end:   q += " AND a.date<=%s";     p.append(end.isoformat())
-    q += " ORDER BY a.date, w.name"
-    df = pd.read_sql(q, conn, params=p)
-    conn.close()
-    return df
+    try:
+        q = """SELECT a.id, a.worker_id, w.name, w.daily_wage,
+                      a.date, a.status, a.hours, a.overtime, a.sunday_pay
+               FROM attendance a JOIN workers w ON a.worker_id=w.id WHERE 1=1"""
+        p = []
+        if wid:   q += " AND a.worker_id=%s"; p.append(wid)
+        if start: q += " AND a.date>=%s";     p.append(start.isoformat())
+        if end:   q += " AND a.date<=%s";     p.append(end.isoformat())
+        q += " ORDER BY a.date, w.name"
+        df = pd.read_sql(q, conn, params=p)
+        return df
+    finally:
+        release_conn(conn)
 
 
 def delete_attendance(rid: int):
     conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("DELETE FROM attendance WHERE id=%s", (rid,))
-    conn.commit(); cur.close(); conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM attendance WHERE id=%s", (rid,))
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -530,31 +570,42 @@ def delete_attendance(rid: int):
 
 def add_advance(wid: int, d: date, amount: float, reason: str):
     conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("INSERT INTO advances (worker_id, date, amount, reason) VALUES (%s, %s, %s, %s)",
-                (wid, d.isoformat(), amount, reason.strip()))
-    conn.commit(); cur.close(); conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO advances (worker_id, date, amount, reason) VALUES (%s, %s, %s, %s)",
+                    (wid, d.isoformat(), amount, reason.strip()))
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
 
 
+@st.cache_data(ttl=15)
 def get_advances(wid=None, start: date=None, end: date=None) -> pd.DataFrame:
     conn = get_conn()
-    q    = """SELECT a.id, a.worker_id, w.name, a.date, a.amount, a.reason
-              FROM advances a JOIN workers w ON a.worker_id=w.id WHERE 1=1"""
-    p = []
-    if wid:   q += " AND a.worker_id=%s"; p.append(wid)
-    if start: q += " AND a.date>=%s";     p.append(start.isoformat())
-    if end:   q += " AND a.date<=%s";     p.append(end.isoformat())
-    q += " ORDER BY a.date DESC, w.name"
-    df = pd.read_sql(q, conn, params=p)
-    conn.close()
-    return df
+    try:
+        q = """SELECT a.id, a.worker_id, w.name, a.date, a.amount, a.reason
+               FROM advances a JOIN workers w ON a.worker_id=w.id WHERE 1=1"""
+        p = []
+        if wid:   q += " AND a.worker_id=%s"; p.append(wid)
+        if start: q += " AND a.date>=%s";     p.append(start.isoformat())
+        if end:   q += " AND a.date<=%s";     p.append(end.isoformat())
+        q += " ORDER BY a.date DESC, w.name"
+        df = pd.read_sql(q, conn, params=p)
+        return df
+    finally:
+        release_conn(conn)
 
 
 def delete_advance(aid: int):
     conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("DELETE FROM advances WHERE id=%s", (aid,))
-    conn.commit(); cur.close(); conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM advances WHERE id=%s", (aid,))
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
 
 
 def get_advance_totals(start: date=None, end: date=None) -> pd.DataFrame:
@@ -564,38 +615,51 @@ def get_advance_totals(start: date=None, end: date=None) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────
-# CANTEEN CRUD  ← NEW
+# CANTEEN CRUD — Daily total per worker (no per-item tracking)
 # ──────────────────────────────────────────────────────────────
 
-def add_canteen_entry(wid: int, d: date, item: str, amount: float):
+def upsert_canteen(wid: int, d: date, amount: float):
+    """Set (or overwrite) the daily canteen total for a worker."""
     conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute(
-        "INSERT INTO canteen (worker_id, date, item, amount) VALUES (%s, %s, %s, %s)",
-        (wid, d.isoformat(), item.strip(), amount)
-    )
-    conn.commit(); cur.close(); conn.close()
-
-
-def get_canteen(wid=None, start: date=None, end: date=None) -> pd.DataFrame:
-    conn = get_conn()
-    q    = """SELECT c.id, c.worker_id, w.name, c.date, c.item, c.amount
-              FROM canteen c JOIN workers w ON c.worker_id=w.id WHERE 1=1"""
-    p = []
-    if wid:   q += " AND c.worker_id=%s"; p.append(wid)
-    if start: q += " AND c.date>=%s";     p.append(start.isoformat())
-    if end:   q += " AND c.date<=%s";     p.append(end.isoformat())
-    q += " ORDER BY c.date DESC, w.name, c.id"
-    df = pd.read_sql(q, conn, params=p)
-    conn.close()
-    return df
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO canteen (worker_id, date, amount)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (worker_id, date) DO UPDATE SET amount = EXCLUDED.amount
+        """, (wid, d.isoformat(), amount))
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
 
 
 def delete_canteen_entry(cid: int):
     conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("DELETE FROM canteen WHERE id=%s", (cid,))
-    conn.commit(); cur.close(); conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM canteen WHERE id=%s", (cid,))
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
+
+
+@st.cache_data(ttl=15)
+def get_canteen(wid=None, start: date=None, end: date=None) -> pd.DataFrame:
+    conn = get_conn()
+    try:
+        q = """SELECT c.id, c.worker_id, w.name, c.date, c.amount
+               FROM canteen c JOIN workers w ON c.worker_id=w.id WHERE 1=1"""
+        p = []
+        if wid:   q += " AND c.worker_id=%s"; p.append(wid)
+        if start: q += " AND c.date>=%s";     p.append(start.isoformat())
+        if end:   q += " AND c.date<=%s";     p.append(end.isoformat())
+        q += " ORDER BY c.date DESC, w.name"
+        df = pd.read_sql(q, conn, params=p)
+        return df
+    finally:
+        release_conn(conn)
 
 
 def get_canteen_totals(start: date=None, end: date=None) -> pd.DataFrame:
@@ -636,7 +700,6 @@ def get_monthly_summary(year: int, month: int) -> pd.DataFrame:
         Gross_Salary =("gross_earned", "sum"),
     ).reset_index()
 
-    # advances
     adv = get_advance_totals(start=first, end=last)
     if not adv.empty:
         s = s.merge(adv[["worker_id","total_advance"]], on="worker_id", how="left")
@@ -644,7 +707,6 @@ def get_monthly_summary(year: int, month: int) -> pd.DataFrame:
         s["total_advance"] = 0.0
     s["total_advance"] = s["total_advance"].fillna(0.0)
 
-    # canteen
     cant = get_canteen_totals(start=first, end=last)
     if not cant.empty:
         s = s.merge(cant[["worker_id","total_canteen"]], on="worker_id", how="left")
@@ -652,7 +714,7 @@ def get_monthly_summary(year: int, month: int) -> pd.DataFrame:
         s["total_canteen"] = 0.0
     s["total_canteen"] = s["total_canteen"].fillna(0.0)
 
-    s["Total_Given"] = s["Sunday_Given"] + s["total_advance"]
+    s["Total_Given"] = s["Sunday_Given"] + s["total_advance"] + s["total_canteen"]
     s["Net_Pay"]     = s["Gross_Salary"] - s["Total_Given"]
 
     s.rename(columns={"name":"Worker","daily_wage":"Daily Wage"}, inplace=True)
@@ -731,13 +793,13 @@ with st.sidebar:
                 color:#6b7a91;letter-spacing:2px;text-transform:uppercase'>Overview</div>
     """, unsafe_allow_html=True)
     m1, m2 = st.columns(2)
-    m1.metric("Workers",      len(workers_df))
-    m2.metric("Att. Recs",    len(att_month))
+    m1.metric("Workers",    len(workers_df))
+    m2.metric("Att. Recs",  len(att_month))
     m3, m4 = st.columns(2)
-    m3.metric("Advances",     len(adv_month))
-    m4.metric("Adv. Total",   f"₹{adv_month['amount'].sum():,.0f}" if not adv_month.empty else "₹0")
+    m3.metric("Advances",   len(adv_month))
+    m4.metric("Adv. Total", f"₹{adv_month['amount'].sum():,.0f}" if not adv_month.empty else "₹0")
     m5, m6 = st.columns(2)
-    m5.metric("🍽 Canteen Entries", len(cant_month))
+    m5.metric("🍽 Canteen Days",  len(cant_month))
     m6.metric("Canteen Total", f"₹{cant_month['amount'].sum():,.0f}" if not cant_month.empty else "₹0")
 
     st.markdown("<hr>", unsafe_allow_html=True)
@@ -809,7 +871,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "👷 Workers",
     "✅ Attendance",
     "💸 Advances",
-    "🍽️ Canteen",        # ← NEW
+    "🍽️ Canteen",
     "📋 Records",
     "📊 Monthly",
     "⚙️ Settings",
@@ -837,8 +899,12 @@ with tab1:
             if st.form_submit_button("＋ Add Worker", use_container_width=True):
                 if w_name.strip():
                     ok, msg = add_worker(w_name, w_wage)
-                    if ok: st.success(f"✅ {msg}"); st.rerun()
-                    else:  st.error(f"❌ {msg}")
+                    if ok:
+                        st.cache_data.clear()
+                        st.success(f"✅ {msg}")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {msg}")
                 else:
                     st.warning("Please enter a name.")
     with c_list:
@@ -861,7 +927,9 @@ with tab1:
                 st.markdown('<div class="btn-danger">', unsafe_allow_html=True)
                 if st.button("🗑 Delete Worker", key="del_w_btn", use_container_width=True):
                     delete_worker(del_wid)
-                    st.success("Deleted."); st.rerun()
+                    st.cache_data.clear()
+                    st.success("Deleted.")
+                    st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -919,6 +987,7 @@ with tab2:
             if st.form_submit_button("💾 Save Attendance", use_container_width=True):
                 hrs_save = 0.0 if sel_status=="Absent" else sel_hours
                 mark_attendance(sel_wid, sel_date, sel_status, hrs_save, sunday_pay_given)
+                st.cache_data.clear()
                 wname = workers_df.loc[workers_df["id"]==sel_wid,"name"].values[0]
                 st.success(f"✅ Saved — {wname} | {sel_date.strftime('%d %b %Y')} | {sel_status} | Earned: ₹{day_sal:,.2f}")
 
@@ -951,6 +1020,7 @@ with tab2:
             if st.form_submit_button("💾 Save All", use_container_width=True):
                 for wid, (s, h) in bulk_data.items():
                     mark_attendance(wid, bulk_date, s, 0.0 if s=="Absent" else h, bulk_sunday[wid])
+                st.cache_data.clear()
                 st.success(f"✅ Bulk attendance saved for {bulk_date.strftime('%d %b %Y')}")
                 st.rerun()
 
@@ -983,6 +1053,7 @@ with tab3:
                 adv_reason = st.text_input("Reason / Note", placeholder="e.g. Medical emergency")
                 if st.form_submit_button("💰 Record Advance", use_container_width=True):
                     add_advance(adv_wid, adv_date, adv_amount, adv_reason)
+                    st.cache_data.clear()
                     wname = workers_df.loc[workers_df["id"]==adv_wid,"name"].values[0]
                     st.success(f"✅ ₹{adv_amount:,.0f} advance recorded for {wname}")
                     st.rerun()
@@ -1022,13 +1093,14 @@ with tab3:
                     st.markdown('<div class="btn-danger">', unsafe_allow_html=True)
                     if st.button("Delete Advance Record", key="del_adv_btn"):
                         delete_advance(int(del_aid))
+                        st.cache_data.clear()
                         st.success(f"Advance #{del_aid} deleted.")
                         st.rerun()
                     st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ════════════════════════════════════════════════════════════════
-# TAB 4 — CANTEEN  ← NEW
+# TAB 4 — CANTEEN (Daily bulk total entry per worker)
 # ════════════════════════════════════════════════════════════════
 with tab4:
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1037,141 +1109,165 @@ with tab4:
     if workers_df.empty:
         st.warning("No workers found. Add workers first.")
     else:
-        c_cant_form, c_cant_list = st.columns([1, 2], gap="large")
+        st.markdown("### 🍽️ Daily Canteen Bill")
+        st.markdown("""
+        <div class='canteen-card'>
+        <span class='title'>How it works</span>
+        Enter each worker's <span class='hl'>total canteen spend for the selected day</span>.
+        Leave at <span class='hl'>₹0</span> to skip a worker — they won't get a record.
+        Re-saving on the same day <span class='hl'>overwrites</span> the previous amount.
+        The canteen total is <span class='hl'>deducted from net salary</span> each month.
+        </div>
+        """, unsafe_allow_html=True)
 
-        # ── Left: Add canteen entry ──────────────────────────────
-        with c_cant_form:
-            st.markdown("### Add Canteen Entry")
-            st.markdown("""
-            <div class='canteen-card'>
-            Record items bought from the canteen for a worker on a given day.
-            <br>The total canteen bill is
-            <span class='hl'>not deducted from their net salary</span>
-            in the monthly summary.
+        # Date picker outside the form so pre-fill values refresh reactively
+        cant_date = st.date_input("📅 Select Date", value=today, key="cant_date_bulk")
+
+        # Load existing entries for this date to pre-fill the inputs
+        existing_today = get_canteen(start=cant_date, end=cant_date)
+        existing_map   = {}
+        if not existing_today.empty:
+            existing_map = dict(zip(existing_today["worker_id"], existing_today["amount"]))
+
+        if existing_map:
+            st.markdown(f"""
+            <div style='font-family:IBM Plex Mono,monospace;font-size:0.72rem;
+                        color:#2eccc0;letter-spacing:1.5px;margin-bottom:8px'>
+            ✏️ Existing entries found for {cant_date.strftime('%d %b %Y')} — fields pre-filled. Save to update.
             </div>
             """, unsafe_allow_html=True)
 
-            with st.form("canteen_form", clear_on_submit=True):
-                cant_wid    = st.selectbox(
-                    "Worker",
-                    workers_df["id"].tolist(),
-                    format_func=lambda i: workers_df.loc[workers_df["id"]==i,"name"].values[0],
-                    key="cant_wid"
-                )
-                cant_date   = st.date_input("Date", value=today, key="cant_date")
-                cant_item   = st.text_input(
-                    "Item / Description",
-                    placeholder="e.g. Tea × 2, Lunch, Biscuits…"
-                )
-                cant_amount = st.number_input(
-                    "Amount (₹)",
-                    min_value=0.5, value=20.0, step=5.0
-                )
+        with st.form("canteen_bulk_form"):
+            st.markdown(f"""
+            <div style='font-family:IBM Plex Mono,monospace;font-size:0.72rem;
+                        color:#c8963e;letter-spacing:2px;margin-bottom:16px'>
+            CANTEEN BILLS FOR: {cant_date.strftime('%d %B %Y (%A)')}
+            </div>
+            """, unsafe_allow_html=True)
 
-                if st.form_submit_button("🍽️ Add Entry", use_container_width=True):
-                    if cant_item.strip():
-                        add_canteen_entry(cant_wid, cant_date, cant_item, cant_amount)
-                        wname = workers_df.loc[workers_df["id"]==cant_wid,"name"].values[0]
-                        st.success(f"✅ ₹{cant_amount:,.2f} — '{cant_item}' recorded for {wname}")
-                        st.rerun()
-                    else:
-                        st.warning("Please enter an item description.")
+            entries = {}
+            ncols = min(3, len(workers_df))
+            cols  = st.columns(ncols)
+            for idx, row in workers_df.iterrows():
+                c = cols[idx % ncols]
+                with c:
+                    prefill = existing_map.get(row["id"], 0.0)
+                    amt = st.number_input(
+                        f"₹ {row['name']}",
+                        min_value=0.0,
+                        value=float(prefill),
+                        step=5.0,
+                        format="%.2f",
+                        key=f"cant_{row['id']}"
+                    )
+                    if prefill > 0:
+                        st.caption(f"✏️ Current saved: ₹{prefill:.0f}")
+                    entries[row["id"]] = (row["name"], amt)
 
-            # ── Quick daily summary for today ──
+            # Live total preview
+            total_preview = sum(v[1] for v in entries.values())
+            st.markdown(f"""
+            <div style='background:#051a1a;border:1px solid #0a4040;border-radius:10px;
+                        padding:14px 20px;margin:16px 0;
+                        display:flex;align-items:center;justify-content:space-between;
+                        font-family:IBM Plex Mono,monospace'>
+                <span style='color:#6b7a91;font-size:0.7rem;letter-spacing:2px;text-transform:uppercase'>
+                    Total canteen for the day
+                </span>
+                <span style='color:#2eccc0;font-size:1.6rem;font-weight:700'>
+                    ₹{total_preview:,.2f}
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if st.form_submit_button("💾 Save All Canteen Bills", use_container_width=True):
+                saved = 0
+                for wid, (name, amt) in entries.items():
+                    if amt > 0:
+                        upsert_canteen(wid, cant_date, amt)
+                        saved += 1
+                st.cache_data.clear()
+                if saved:
+                    st.success(f"✅ Saved canteen bills for {saved} worker(s) on {cant_date.strftime('%d %b %Y')}")
+                else:
+                    st.warning("All amounts were ₹0 — nothing saved.")
+                st.rerun()
+
+        # ── Quick today's glance ─────────────────────────────────
+        st.markdown("<hr>", unsafe_allow_html=True)
+        st.markdown("#### Today's Canteen at a Glance")
+        today_cant = get_canteen(start=today, end=today)
+        if today_cant.empty:
+            st.info("No canteen entries for today yet.")
+        else:
+            daily_cols = st.columns(len(today_cant) if len(today_cant) <= 4 else 4)
+            for i, row in today_cant.iterrows():
+                daily_cols[i % 4].metric(row["name"], f"₹{row['amount']:,.2f}")
+            st.metric("Total Canteen Spend Today", f"₹{today_cant['amount'].sum():,.2f}")
+
+        # ── History ─────────────────────────────────────────────
+        st.markdown("<hr>", unsafe_allow_html=True)
+        st.markdown("### Canteen History")
+
+        cf1, cf2, cf3 = st.columns(3)
+        with cf1:
+            cant_filter_w = st.selectbox(
+                "Worker", [None]+workers_df["id"].tolist(),
+                format_func=lambda i: "All" if i is None else
+                    workers_df.loc[workers_df["id"]==i,"name"].values[0],
+                key="cant_fw"
+            )
+        with cf2:
+            cant_fs = st.date_input("From", value=today.replace(day=1), key="cant_s")
+        with cf3:
+            cant_fe = st.date_input("To", value=today, key="cant_e")
+
+        canteen_records = get_canteen(wid=cant_filter_w, start=cant_fs, end=cant_fe)
+
+        if canteen_records.empty:
+            st.info("No canteen records for the selected filters.")
+        else:
+            cm1, cm2 = st.columns(2)
+            cm1.metric("Days Recorded",    len(canteen_records))
+            cm2.metric("Total Canteen Bill", f"₹{canteen_records['amount'].sum():,.2f}")
+
+            # Per-worker summary
+            cant_summary = canteen_records.groupby("name")["amount"].agg(
+                Days="count", Total="sum"
+            ).reset_index().rename(columns={
+                "name":"Worker", "Days":"Days", "Total":"Total Bill (₹)"
+            })
+            st.dataframe(cant_summary, use_container_width=True, hide_index=True)
+
+            # Full records table
             st.markdown("<br>", unsafe_allow_html=True)
-            st.markdown("#### Today's Canteen at a Glance")
-            today_cant = get_canteen(start=today, end=today)
-            if today_cant.empty:
-                st.info("No canteen entries for today yet.")
-            else:
-                daily_summary = today_cant.groupby("name")["amount"].sum().reset_index()
-                daily_summary.columns = ["Worker", "Bill Today (₹)"]
-                st.dataframe(daily_summary, use_container_width=True, hide_index=True)
-                st.metric("Total Canteen Spend Today", f"₹{today_cant['amount'].sum():,.2f}")
+            st.markdown("##### All Records")
+            disp_cant = canteen_records[["id","name","date","amount"]].rename(columns={
+                "id":"ID","name":"Worker","date":"Date","amount":"Daily Bill (₹)"
+            })
+            st.dataframe(disp_cant, use_container_width=True, hide_index=True)
 
-        # ── Right: History & delete ──────────────────────────────
-        with c_cant_list:
-            st.markdown("### Canteen History")
+            st.markdown("<hr>", unsafe_allow_html=True)
+            st.markdown("#### 🗑️ Delete Entry")
+            st.caption("Use the ID from the table above.")
+            del_cid = st.number_input("Canteen Entry ID to delete", min_value=1, step=1, key="del_cant")
+            with st.container():
+                st.markdown('<div class="btn-danger">', unsafe_allow_html=True)
+                if st.button("Delete Canteen Entry", key="del_cant_btn"):
+                    delete_canteen_entry(int(del_cid))
+                    st.cache_data.clear()
+                    st.success(f"Entry #{del_cid} deleted.")
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
 
-            cf1, cf2, cf3 = st.columns(3)
-            with cf1:
-                cant_filter_w = st.selectbox(
-                    "Worker", [None]+workers_df["id"].tolist(),
-                    format_func=lambda i: "All" if i is None else
-                        workers_df.loc[workers_df["id"]==i,"name"].values[0],
-                    key="cant_fw"
-                )
-            with cf2:
-                cant_fs = st.date_input("From", value=today.replace(day=1), key="cant_s")
-            with cf3:
-                cant_fe = st.date_input("To",   value=today,               key="cant_e")
-
-            canteen_records = get_canteen(wid=cant_filter_w, start=cant_fs, end=cant_fe)
-
-            if canteen_records.empty:
-                st.info("No canteen records for the selected filters.")
-            else:
-                # Summary per worker
-                cant_summary = canteen_records.groupby("name")["amount"].agg(
-                    Entries="count", Total="sum"
-                ).reset_index().rename(columns={
-                    "name": "Worker",
-                    "Entries": "# Items",
-                    "Total": "Total Bill (₹)"
-                })
-
-                cm1, cm2 = st.columns(2)
-                cm1.metric("Total Entries",      len(canteen_records))
-                cm2.metric("Total Canteen Bill", f"₹{canteen_records['amount'].sum():,.2f}")
-
-                st.dataframe(cant_summary, use_container_width=True, hide_index=True)
-
-                # Daily breakdown (groupby worker + date)
-                st.markdown("<br>", unsafe_allow_html=True)
-                st.markdown("##### Daily Breakdown")
-                daily_break = (
-                    canteen_records
-                    .groupby(["name","date"])["amount"]
-                    .sum()
-                    .reset_index()
-                    .rename(columns={"name":"Worker","date":"Date","amount":"Daily Total (₹)"})
-                    .sort_values(["Date","Worker"], ascending=[False, True])
-                )
-                st.dataframe(daily_break, use_container_width=True, hide_index=True)
-
-                # All individual entries
-                st.markdown("<br>", unsafe_allow_html=True)
-                st.markdown("##### All Individual Entries")
-                disp_cant = canteen_records[["id","name","date","item","amount"]].rename(columns={
-                    "id":     "ID",
-                    "name":   "Worker",
-                    "date":   "Date",
-                    "item":   "Item",
-                    "amount": "Amount (₹)"
-                })
-                st.dataframe(disp_cant, use_container_width=True, hide_index=True)
-
-                st.markdown("<hr>", unsafe_allow_html=True)
-                st.markdown("#### 🗑️ Delete Canteen Entry")
-                st.caption("Use the ID from the 'All Individual Entries' table above.")
-                del_cid = st.number_input("Canteen Entry ID to delete", min_value=1, step=1, key="del_cant")
-                with st.container():
-                    st.markdown('<div class="btn-danger">', unsafe_allow_html=True)
-                    if st.button("Delete Canteen Entry", key="del_cant_btn"):
-                        delete_canteen_entry(int(del_cid))
-                        st.success(f"Entry #{del_cid} deleted.")
-                        st.rerun()
-                    st.markdown('</div>', unsafe_allow_html=True)
-
-                # CSV export
-                st.markdown("<hr>", unsafe_allow_html=True)
-                buf_c = io.StringIO()
-                disp_cant.to_csv(buf_c, index=False)
-                st.download_button(
-                    "📥 Download Canteen CSV", buf_c.getvalue(),
-                    f"canteen_{cant_fs}_{cant_fe}.csv", "text/csv",
-                    use_container_width=True
-                )
+            st.markdown("<hr>", unsafe_allow_html=True)
+            buf_c = io.StringIO()
+            disp_cant.to_csv(buf_c, index=False)
+            st.download_button(
+                "📥 Download Canteen CSV", buf_c.getvalue(),
+                f"canteen_{cant_fs}_{cant_fe}.csv", "text/csv",
+                use_container_width=True
+            )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1218,6 +1314,7 @@ with tab5:
             st.markdown('<div class="btn-danger">', unsafe_allow_html=True)
             if st.button("Delete Record", key="del_r_btn"):
                 delete_attendance(int(del_rid))
+                st.cache_data.clear()
                 st.success(f"Record #{del_rid} deleted.")
                 st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
@@ -1271,7 +1368,7 @@ with tab6:
             "Gross_Salary":  "Gross Earned (₹)",
             "Sunday_Given":  "Sunday Cash Given (₹)",
             "total_advance": "Advances Given (₹)",
-            "total_canteen": "Canteen Bill (₹)",     # ← NEW column
+            "total_canteen": "Canteen Bill (₹)",
             "Total_Given":   "Total Given (₹)",
             "Net_Pay":       "Net to Pay (₹)",
         })
@@ -1285,13 +1382,13 @@ with tab6:
         </div>
         """, unsafe_allow_html=True)
         gm1,gm2,gm3,gm4,gm5,gm6,gm7 = st.columns(7)
-        gm1.metric("Workers",           len(summary))
-        gm2.metric("Gross Earned",      f"₹{summary['Gross_Salary'].sum():,.0f}")
-        gm3.metric("Sunday Cash",       f"₹{summary['Sunday_Given'].sum():,.0f}")
-        gm4.metric("Advances",          f"₹{summary['total_advance'].sum():,.0f}")
-        gm5.metric("Canteen Bill",      f"₹{summary['total_canteen'].sum():,.0f}")
-        gm6.metric("Total Given Out",   f"₹{summary['Total_Given'].sum():,.0f}")
-        gm7.metric("Net to Pay",        f"₹{summary['Net_Pay'].sum():,.0f}")
+        gm1.metric("Workers",         len(summary))
+        gm2.metric("Gross Earned",    f"₹{summary['Gross_Salary'].sum():,.0f}")
+        gm3.metric("Sunday Cash",     f"₹{summary['Sunday_Given'].sum():,.0f}")
+        gm4.metric("Advances",        f"₹{summary['total_advance'].sum():,.0f}")
+        gm5.metric("Canteen Bill",    f"₹{summary['total_canteen'].sum():,.0f}")
+        gm6.metric("Total Given Out", f"₹{summary['Total_Given'].sum():,.0f}")
+        gm7.metric("Net to Pay",      f"₹{summary['Net_Pay'].sum():,.0f}")
         buf2 = io.StringIO(); disp_s.to_csv(buf2, index=False)
         st.download_button("📥 Download Monthly Report (CSV)", buf2.getvalue(),
                            f"payroll_{calendar.month_name[sel_month]}_{sel_year}.csv",
@@ -1338,19 +1435,23 @@ with tab7:
             if st.form_submit_button("💾 Save All Wages", use_container_width=True):
                 for wid, wage in updates.items():
                     update_wage(wid, wage)
+                st.cache_data.clear()
                 st.success("✅ Wages updated.")
                 st.rerun()
     st.markdown("<hr>", unsafe_allow_html=True)
     st.markdown("### 🗄️ Database Info")
     conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM attendance"); att_c = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM advances");   adv_c = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM canteen");    cant_c = cur.fetchone()[0]
-    cur.close(); conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM attendance"); att_c  = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM advances");   adv_c  = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM canteen");    cant_c = cur.fetchone()[0]
+        cur.close()
+    finally:
+        release_conn(conn)
     di1,di2,di3,di4 = st.columns(4)
-    di1.metric("Workers",        len(workers_df))
-    di2.metric("Att. Records",   att_c)
-    di3.metric("Adv. Records",   adv_c)
+    di1.metric("Workers",         len(workers_df))
+    di2.metric("Att. Records",    att_c)
+    di3.metric("Adv. Records",    adv_c)
     di4.metric("Canteen Entries", cant_c)
     st.markdown(f"**Database:** Supabase (PostgreSQL)")
